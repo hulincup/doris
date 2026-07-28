@@ -159,6 +159,64 @@ get_queue_build_of_pr() {
 }
 # get_queue_build_of_pr "$1" "$2"
 
+get_active_builds_of_revision() {
+    # Return active build IDs for the same PR, pipeline, and revision.
+    # Return 0 when a duplicate exists, 1 when none exists, and 2 when lookup fails.
+    local PULL_REQUEST_NUM="${PULL_REQUEST_NUM:-$1}"
+    local COMMENT_TRIGGER_TYPE="${COMMENT_TRIGGER_TYPE:-$2}"
+    local COMMIT_ID_FROM_TRIGGER="${COMMIT_ID_FROM_TRIGGER:-$3}"
+    if [[ -z "${PULL_REQUEST_NUM}" ||
+        -z "${COMMENT_TRIGGER_TYPE}" ||
+        -z "${COMMIT_ID_FROM_TRIGGER}" ]]; then
+        echo "Usage: get_active_builds_of_revision PULL_REQUEST_NUM COMMENT_TRIGGER_TYPE COMMIT_ID_FROM_TRIGGER" >&2
+        return 2
+    fi
+
+    local PIPELINE="${comment_to_pipeline[${COMMENT_TRIGGER_TYPE}]}"
+    local teamcity_rest_url="http://43.132.222.7:8111/app/rest"
+    local queue_response
+    local running_response
+    if ! queue_response=$(
+        curl -sSf -X GET \
+            -u OneMoreChance:OneMoreChance \
+            -H "Accept: application/json" \
+            "${teamcity_rest_url}/buildQueue?locator=buildType:(id:${PIPELINE})&fields=build(id,branchName,revisions(revision(version)))"
+    ); then
+        echo "WARNING: failed to get queued builds for duplicate check" >&2
+        return 2
+    fi
+    if ! running_response=$(
+        curl -sSf -X GET \
+            -u OneMoreChance:OneMoreChance \
+            -H "Accept: application/json" \
+            "${teamcity_rest_url}/builds?locator=buildType:(id:${PIPELINE}),branch:(name:pull/${PULL_REQUEST_NUM}),running:true&fields=build(id,branchName,revisions(revision(version)))"
+    ); then
+        echo "WARNING: failed to get running builds for duplicate check" >&2
+        return 2
+    fi
+
+    local build_ids
+    if ! build_ids=$(
+        printf '%s\n%s\n' "${queue_response}" "${running_response}" |
+            jq -s -r \
+                --arg branch "pull/${PULL_REQUEST_NUM}" \
+                --arg revision "${COMMIT_ID_FROM_TRIGGER}" \
+                '.[] | .build[]? |
+                 select(.branchName == $branch and .revisions.revision[0].version == $revision) |
+                 .id'
+    ); then
+        echo "WARNING: failed to parse active builds for duplicate check" >&2
+        return 2
+    fi
+
+    if [[ -n "${build_ids}" ]]; then
+        echo "${build_ids}"
+        return 0
+    fi
+    return 1
+}
+# get_active_builds_of_revision "$1" "$2" "$3"
+
 cancel_running_build() {
     local PULL_REQUEST_NUM="${PULL_REQUEST_NUM:-$1}"
     local COMMENT_TRIGGER_TYPE="${COMMENT_TRIGGER_TYPE:-$2}"
@@ -300,6 +358,21 @@ trigger_or_skip_build() {
     fi
 
     if [[ "${FILE_CHANGED:-"true"}" == "true" ]]; then
+        local duplicate_build_ids
+        local duplicate_lookup_status=0
+        duplicate_build_ids=$(
+            get_active_builds_of_revision \
+                "${PULL_REQUEST_NUM}" \
+                "${COMMENT_TRIGGER_TYPE}" \
+                "${COMMIT_ID_FROM_TRIGGER}"
+        ) || duplicate_lookup_status=$?
+        if [[ ${duplicate_lookup_status} -eq 0 ]]; then
+            echo "INFO: active build(s) ${duplicate_build_ids//$'\n'/,} already exist for PR ${PULL_REQUEST_NUM}, pipeline ${COMMENT_TRIGGER_TYPE}, revision ${COMMIT_ID_FROM_TRIGGER}; skip duplicate trigger"
+            return 0
+        elif [[ ${duplicate_lookup_status} -ne 1 ]]; then
+            echo "WARNING: duplicate lookup failed for PR ${PULL_REQUEST_NUM}, pipeline ${COMMENT_TRIGGER_TYPE}; continue with the existing trigger flow"
+        fi
+
         cancel_running_build "${PULL_REQUEST_NUM}" "${COMMENT_TRIGGER_TYPE}"
         cancel_queue_build "${PULL_REQUEST_NUM}" "${COMMENT_TRIGGER_TYPE}"
         trigger_build "${PULL_REQUEST_NUM}" "${COMMIT_ID_FROM_TRIGGER}" "${COMMENT_TRIGGER_TYPE}" "${COMMENT_REPEAT_TIMES}"
